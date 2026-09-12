@@ -1,0 +1,100 @@
+.embedded-outline-view { padding: 0; }
+.embedded-outline-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 8px 8px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.embedded-outline-title { font-weight: var(--font-semibold); flex: 1; }
+.embedded-outline-refresh { border: 0; background: transparent; box-shadow: none; }
+.embedded-outline-empty { padding: 16px 12px; color: var(--text-muted); }
+.embedded-outline-tree { padding: 6px 4px 12px 4px; }
+.embedded-outline-node { min-width: 0; }
+.embedded-outline-row {
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  border-radius: var(--radius-s);
+  padding: 0 6px 0 2px;
+  cursor: default;
+  color: var(--text-normal);
+}
+.embedded-outline-row:hover { background: var(--nav-item-background-hover); }
+.embedded-outline-row.is-embedded { color: var(--text-muted); }
+.embedded-outline-twisty {
+  flex: 0 0 22px;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 3px;
+}
+.embedded-outline-twisty-spacer { flex: 0 0 22px; width: 22px; }
+.embedded-outline-embed-icon {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  margin-right: 4px;
+  color: var(--text-faint);
+}
+.embedded-outline-embed-icon svg { width: 14px; height: 14px; }
+.embedded-outline-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-ui-small);
+}
+.embedded-outline-source {
+  flex: 0 1 36%;
+  max-width: 36%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-left: 8px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+}
+.embedded-outline-children { margin-left: 14px; border-left: 1px solid var(--background-modifier-border); }
+.embedded-outline-children.is-collapsed { display: none; }
+
+.embedded-outline-row.is-embed-container {
+  color: var(--text-normal);
+  font-weight: var(--font-medium);
+}
+.embedded-outline-row.is-embed-container .embedded-outline-label {
+  color: var(--text-accent);
+}
+
+/* Breathing background feedback after outline navigation. Applied to the
+   actual heading line/element in the document, not to the outline row. */
+.embedded-outline-nav-target {
+  border-radius: var(--radius-s);
+  animation: embedded-outline-nav-breathe var(--embedded-outline-highlight-duration, 1500ms) ease-in-out both;
+}
+
+@keyframes embedded-outline-nav-breathe {
+  0%, 100% {
+    background-color: transparent;
+    box-shadow: 0 0 0 0 transparent;
+  }
+  18% {
+    background-color: color-mix(in srgb, var(--interactive-accent) 30%, transparent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+  }
+  42% {
+    background-color: color-mix(in srgb, var(--interactive-accent) 8%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--interactive-accent) 4%, transparent);
+  }
+  68% {
+    background-color: color-mix(in srgb, var(--interactive-accent) 24%, transparent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 10%, transparent);
+  }
+  86% {
+    background-color: color-mix(in srgb, var(--interactive-accent) 6%, transparent);
+    box-shadow: 0 0 0 1px transparent;
+  }
+}
