@@ -918,6 +918,19 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     }
   }
 
+  isElementVisibleInBoundary(el, boundaryEl) {
+    if (!el?.isConnected || !boundaryEl?.getBoundingClientRect) return false;
+    try {
+      const rect = el.getBoundingClientRect();
+      const boundary = boundaryEl.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0
+        && rect.bottom > boundary.top + 8
+        && rect.top < boundary.bottom - 8;
+    } catch (_) {
+      return false;
+    }
+  }
+
   async nativeApplyMarkdownViewScroll(markdownView, line, debug = null, prefix = "host") {
     if (!markdownView || !Number.isInteger(line) || line < 0) return false;
     const editor = markdownView.editor;
@@ -1283,7 +1296,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
   }
 
   async navigateEmbeddedTrailInPlace(view, item, debug) {
-    const container = await this.resolveEmbedTrail(view, item, debug);
+    let container = await this.resolveEmbedTrail(view, item, debug);
     if (!container) {
       debug.result = "embed-trail-not-resolved";
       return false;
@@ -1335,6 +1348,32 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     const lastStep = trail[trail.length - 1] || null;
 
     if (container.matches?.(".sync-embed")) {
+      // A nested Sync heading can be rendered while its host block is still
+      // outside the host reading viewport. Scrolling only the nested
+      // MarkdownView then updates an off-screen surface and appears to do
+      // nothing. Reveal the host block first, but only when it is actually
+      // outside the host viewport; this keeps nearby clicks single-pass.
+      const hostBoundary = this.getPreviewRoot(view) || view.containerEl;
+      const hostEmbedVisible = this.isElementVisibleInBoundary(container, hostBoundary);
+      debug.hostEmbedVisibleBeforeScroll = hostEmbedVisible;
+      if (!hostEmbedVisible && Number.isInteger(item.hostEmbedLine)) {
+        debug.hostEmbedRevealRequired = true;
+        const revealed = await this.nativeApplyMarkdownViewScroll(view, item.hostEmbedLine, debug, "hostEmbed");
+        debug.hostEmbedRevealApplied = revealed;
+        if (revealed) {
+          // Sync Embeds may replace its loading placeholder with a fresh
+          // container after the host MarkdownView has mounted the block. Do
+          // not keep navigating through the stale placeholder reference.
+          await this.wait(180);
+          const refreshed = await this.resolveEmbedTrail(view, item, debug);
+          if (refreshed) {
+            container = refreshed;
+            debug.resolvedTargetContainerClass = container.className || "";
+            debug.syncContainerReResolvedAfterHostReveal = true;
+          }
+        }
+      }
+
       const manager = this.getSyncEmbedsPlugin()?.embedManager;
       let data = manager?.getEmbedFromElement?.(container) || null;
 
@@ -1351,6 +1390,15 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
         while (!data?.editor && Date.now() < deadline) {
           await this.wait(45);
           data = manager?.getEmbedFromElement?.(container) || null;
+          if (!data?.editor) {
+            const refreshed = await this.resolveEmbedTrail(view, item, debug);
+            if (refreshed && refreshed !== container) {
+              container = refreshed;
+              debug.resolvedTargetContainerClass = container.className || "";
+              debug.syncContainerReResolvedDuringLazyLoad = true;
+              data = manager?.getEmbedFromElement?.(container) || null;
+            }
+          }
         }
       }
 
