@@ -213,6 +213,9 @@ const DEFAULT_SETTINGS = {
   highlightDurationMs: 1500,
 };
 
+const BEHAVIOR_RECORDING_SCHEMA = 1;
+const MAX_BEHAVIOR_EVENTS = 2500;
+
 function clampLevel(level) {
   return Math.max(1, Math.min(12, level));
 }
@@ -436,9 +439,20 @@ class EmbeddedOutlineView extends ItemView {
 
     const header = el.createDiv({ cls: "embedded-outline-header" });
     header.createDiv({ cls: "embedded-outline-title", text: "Embedded Outline" });
+    const recordingStatus = header.createSpan({ cls: "embedded-outline-recording-status" });
+    const recordBtn = header.createEl("button", {
+      cls: "clickable-icon embedded-outline-record",
+      attr: { "aria-label": "Start behavior recording", title: "Start behavior recording" },
+    });
+    recordBtn.addEventListener("click", async ev => {
+      ev.stopPropagation();
+      if (this.plugin.isBehaviorRecording()) await this.plugin.stopBehaviorRecording({ copy: true });
+      else this.plugin.startBehaviorRecording();
+    });
     const refreshBtn = header.createEl("button", { cls: "clickable-icon embedded-outline-refresh", attr: { "aria-label": "Refresh embedded outline" } });
     setIcon(refreshBtn, "refresh-cw");
     refreshBtn.addEventListener("click", () => this.refresh());
+    this.plugin.updateBehaviorRecordingIndicators();
 
     if (!(activeFile instanceof TFile) || activeFile.extension !== "md") {
       el.createDiv({ cls: "embedded-outline-empty", text: "Open a Markdown note to see its outline." });
@@ -452,6 +466,11 @@ class EmbeddedOutlineView extends ItemView {
     if (seq !== this.refreshSeq) return;
     this.items = result.items;
     this.dependencyPaths = result.dependencyPaths;
+    this.plugin.recordBehavior("outline-refresh", {
+      activeFile: activeFile.path,
+      itemCount: this.items.length,
+      dependencyPaths: Array.from(this.dependencyPaths),
+    });
 
     if (!this.items.length) {
       el.createDiv({ cls: "embedded-outline-empty", text: "No headings found." });
@@ -495,7 +514,13 @@ class EmbeddedOutlineView extends ItemView {
       const label = row.createDiv({ cls: "embedded-outline-label", text: node.title });
       if (node.kind === "embed") label.setAttr("title", `${node.sourceFile} · H${node.originalLevel}`);
       if (node.kind === "embed-container") label.setAttr("title", `Embedded: ${node.sourceFile}`);
-      row.addEventListener("click", () => this.plugin.navigateToItem(node));
+      row.addEventListener("click", () => {
+        this.plugin.recordBehavior("outline-row-click", {
+          item: this.plugin.serializeBehaviorItem(node),
+          row: { kind: node.kind, level: node.level, title: node.title },
+        });
+        void this.plugin.navigateToItem(node);
+      });
 
       if (this.plugin.settings.showSource && node.kind === "embed") {
         const source = row.createSpan({ cls: "embedded-outline-source", text: this.plugin.shortSource(node.sourceFile) });
@@ -599,6 +624,12 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     await this.loadSettings();
     this.refreshTimer = null;
     this.lastNavigationDebug = null;
+    this.behaviorRecorder = null;
+    this.lastBehaviorRecording = null;
+    this.behaviorDomCleanup = [];
+    this.behaviorScrollLast = new WeakMap();
+    this.behaviorWheelLast = 0;
+    this.behaviorEditorChangeLast = 0;
     this.registerView(VIEW_TYPE, leaf => new EmbeddedOutlineView(leaf, this));
     this.addSettingTab(new EmbeddedOutlineSettingTab(this.app, this));
 
@@ -606,6 +637,11 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     this.addCommand({ id: "open-embedded-outline", name: "Open Embedded Outline", callback: () => this.activateView() });
     this.addCommand({ id: "refresh-embedded-outline", name: "Refresh Embedded Outline", callback: () => this.scheduleRefresh(0) });
     this.addCommand({ id: "copy-navigation-diagnostics", name: "Copy last navigation diagnostics", callback: () => this.copyNavigationDiagnostics() });
+    this.addCommand({ id: "start-behavior-recording", name: "开始录制 Embedded Outline 行为", callback: () => this.startBehaviorRecording() });
+    this.addCommand({ id: "stop-behavior-recording-copy", name: "停止录制并复制行为日志", callback: () => this.stopBehaviorRecording({ copy: true }) });
+    this.addCommand({ id: "stop-behavior-recording-save", name: "停止录制并保存行为日志", callback: () => this.stopBehaviorRecording({ save: true }) });
+    this.addCommand({ id: "copy-last-behavior-recording", name: "复制上一次行为日志", callback: () => this.copyBehaviorRecording() });
+    this.addCommand({ id: "clear-behavior-recording", name: "清除行为录制", callback: () => this.clearBehaviorRecording() });
     this.addCommand({ id: "repair-outline-panes", name: "Repair duplicate Embedded Outline panes", callback: async () => {
       const leaf = await this.reconcileOutlinePanes({ reveal: true });
       new Notice(leaf ? "Embedded Outline: duplicate panes repaired." : "Embedded Outline: no pane needed repair.");
@@ -623,23 +659,49 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     this.registerEvent(this.app.workspace.on("active-leaf-change", leaf => {
       const view = leaf?.view;
       if (view instanceof MarkdownView && view.file?.extension === "md") this.lastMarkdownFilePath = view.file.path;
+      this.recordBehavior("active-leaf-change", {
+        viewType: view?.getViewType?.() || view?.constructor?.name || null,
+        filePath: view?.file?.path || null,
+        mode: view instanceof MarkdownView ? this.getMarkdownViewMode(view) : null,
+      });
       this.scheduleRefresh(50);
     }));
     this.registerEvent(this.app.workspace.on("file-open", file => {
       if (file instanceof TFile && file.extension === "md") this.lastMarkdownFilePath = file.path;
+      this.recordBehavior("file-open", { filePath: file?.path || null, extension: file?.extension || null });
       this.scheduleRefresh(50);
     }));
     this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
+      const now = Date.now();
+      if (now - this.behaviorEditorChangeLast >= 150) {
+        this.behaviorEditorChangeLast = now;
+        this.recordBehavior("editor-change", {
+          filePath: info?.file?.path || null,
+          viewType: info?.getViewType?.() || info?.constructor?.name || null,
+          mode: info instanceof MarkdownView ? this.getMarkdownViewMode(info) : null,
+        });
+      }
       if (info instanceof MarkdownView) this.scheduleRefresh(180);
       else this.scheduleRefresh(180);
     }));
-    this.registerEvent(this.app.metadataCache.on("changed", file => this.refreshIfRelevant(file.path)));
-    this.registerEvent(this.app.vault.on("rename", file => this.refreshIfRelevant(file.path)));
-    this.registerEvent(this.app.vault.on("delete", file => this.refreshIfRelevant(file.path)));
+    this.registerEvent(this.app.metadataCache.on("changed", file => {
+      this.recordBehavior("metadata-changed", { filePath: file?.path || null });
+      this.refreshIfRelevant(file.path);
+    }));
+    this.registerEvent(this.app.vault.on("rename", file => {
+      this.recordBehavior("vault-rename", { filePath: file?.path || null });
+      this.refreshIfRelevant(file.path);
+    }));
+    this.registerEvent(this.app.vault.on("delete", file => {
+      this.recordBehavior("vault-delete", { filePath: file?.path || null });
+      this.refreshIfRelevant(file.path);
+    }));
   }
 
   onunload() {
     if (this.refreshTimer) window.clearTimeout(this.refreshTimer);
+    if (this.behaviorRecorder) void this.stopBehaviorRecording({ silent: true });
+    else this.removeBehaviorDomListeners();
     void this.restoreOutlineForUnload();
   }
 
@@ -650,6 +712,374 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
     this.scheduleRefresh(0);
+  }
+
+  isBehaviorRecording() {
+    return !!this.behaviorRecorder;
+  }
+
+  serializeBehaviorItem(item) {
+    if (!item) return null;
+    return {
+      id: item.id || null,
+      kind: item.kind || null,
+      title: item.title || null,
+      hostFile: item.hostFile || null,
+      hostEmbedLine: Number.isInteger(item.hostEmbedLine) ? item.hostEmbedLine : null,
+      sourceFile: item.sourceFile || null,
+      sourceLine: Number.isInteger(item.sourceLine) ? item.sourceLine : null,
+      sourceHeading: item.sourceHeading || null,
+      section: item.section || "",
+      depth: Number.isInteger(item.depth) ? item.depth : null,
+      embedType: item.embedType || null,
+      embedOrdinal: Number.isInteger(item.embedOrdinal) ? item.embedOrdinal : null,
+      rootEmbedType: item.rootEmbedType || null,
+      rootEmbedOrdinal: Number.isInteger(item.rootEmbedOrdinal) ? item.rootEmbedOrdinal : null,
+      rootEmbedSourceFile: item.rootEmbedSourceFile || null,
+      rootEmbedSection: item.rootEmbedSection || "",
+      embedTrail: Array.isArray(item.embedTrail) ? item.embedTrail.map(step => ({
+        type: step?.type || null,
+        ordinal: Number.isInteger(step?.ordinal) ? step.ordinal : null,
+        sourceFile: step?.sourceFile || null,
+        section: step?.section || "",
+        containingFile: step?.containingFile || null,
+        sourceLine: Number.isInteger(step?.sourceLine) ? step.sourceLine : null,
+      })) : [],
+    };
+  }
+
+  sanitizeBehaviorValue(value, depth = 0) {
+    if (value == null || typeof value === "boolean" || typeof value === "number") return value;
+    if (typeof value === "string") return value.length > 512 ? `${value.slice(0, 509)}...` : value;
+    if (depth >= 5) return "[truncated]";
+    if (Array.isArray(value)) return value.slice(0, 40).map(item => this.sanitizeBehaviorValue(item, depth + 1));
+    if (value instanceof TFile) return value.path;
+    if (value instanceof Error) return { name: value.name, message: value.message };
+    if (typeof value === "object") {
+      const result = {};
+      for (const [key, item] of Object.entries(value).slice(0, 48)) {
+        result[key] = this.sanitizeBehaviorValue(item, depth + 1);
+      }
+      return result;
+    }
+    return String(value);
+  }
+
+  describeBehaviorElement(el) {
+    if (!el || el.nodeType !== 1) return null;
+    const row = el.closest?.(".embedded-outline-row");
+    const heading = el.matches?.("h1,h2,h3,h4,h5,h6") ? normalizeHeadingText(el.textContent) : null;
+    const label = row?.querySelector?.(".embedded-outline-label")?.textContent || null;
+    const className = typeof el.className === "string" ? el.className : "";
+    const parentEmbed = el.closest?.(".sync-embed, .internal-embed[src]");
+    return {
+      tag: el.tagName?.toLowerCase?.() || null,
+      id: el.getAttribute?.("id") || null,
+      className: className.slice(0, 260),
+      role: el.getAttribute?.("role") || null,
+      ariaLabel: el.getAttribute?.("aria-label") || null,
+      outlineLabel: label ? normalizeHeadingText(label) : null,
+      heading: heading || null,
+      embedClass: parentEmbed && typeof parentEmbed.className === "string" ? parentEmbed.className.slice(0, 260) : null,
+    };
+  }
+
+  behaviorElementFromEvent(event) {
+    const target = event?.target;
+    if (target?.nodeType === 1) return target;
+    return target?.parentElement || null;
+  }
+
+  isBehaviorInterestingTarget(target) {
+    const el = target?.nodeType === 1 ? target : target?.parentElement;
+    return !!el?.closest?.(".embedded-outline-view, .markdown-preview-view, .markdown-source-view, .sync-embed, .internal-embed[src]");
+  }
+
+  snapshotBehaviorScrollTarget(target) {
+    if (!target) return null;
+    const el = target.nodeType === 1 ? target : target.scrollingElement || null;
+    if (!el) return null;
+    let rect = null;
+    try {
+      const r = el.getBoundingClientRect?.();
+      if (r) rect = { top: Math.round(r.top), bottom: Math.round(r.bottom), height: Math.round(r.height) };
+    } catch (_) {}
+    return {
+      target: this.describeBehaviorElement(el),
+      scrollTop: Number.isFinite(el.scrollTop) ? Math.round(el.scrollTop) : null,
+      scrollLeft: Number.isFinite(el.scrollLeft) ? Math.round(el.scrollLeft) : null,
+      scrollHeight: Number.isFinite(el.scrollHeight) ? Math.round(el.scrollHeight) : null,
+      clientHeight: Number.isFinite(el.clientHeight) ? Math.round(el.clientHeight) : null,
+      rect,
+    };
+  }
+
+  getBehaviorScrollSurfaces() {
+    const root = this.app.workspace?.containerEl;
+    if (!root?.querySelectorAll) return [];
+    const elements = [];
+    const seen = new Set();
+    const selector = ".markdown-preview-view, .markdown-source-view, .embedded-outline-view, .sync-embed, .internal-embed[src]";
+    for (const el of root.querySelectorAll(selector)) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      const snapshot = this.snapshotBehaviorScrollTarget(el);
+      if (snapshot) elements.push(snapshot);
+      if (elements.length >= 40) break;
+    }
+    return elements;
+  }
+
+  captureBehaviorContext() {
+    const activeFile = this.getHostFile();
+    const view = activeFile ? this.findMarkdownViewForPath(activeFile.path) : null;
+    return {
+      activeFile: activeFile?.path || null,
+      activeViewType: view?.getViewType?.() || view?.constructor?.name || null,
+      activeViewMode: view ? this.getMarkdownViewMode(view) : null,
+      outlineViewCount: this.getViews().length,
+      scrollSurfaces: this.getBehaviorScrollSurfaces(),
+    };
+  }
+
+  recordBehavior(type, data = {}) {
+    const recorder = this.behaviorRecorder;
+    if (!recorder) return;
+    if (recorder.events.length >= MAX_BEHAVIOR_EVENTS) {
+      recorder.droppedEvents += 1;
+      return;
+    }
+    recorder.events.push({
+      seq: recorder.events.length + 1,
+      elapsedMs: Math.max(0, Date.now() - recorder.startedAtMs),
+      timestamp: new Date().toISOString(),
+      type,
+      data: this.sanitizeBehaviorValue(data),
+    });
+  }
+
+  installBehaviorDomListeners() {
+    if (this.behaviorDomCleanup.length) return;
+    this.behaviorScrollLast = new WeakMap();
+    this.behaviorWheelLast = 0;
+    const cleanup = [];
+
+    const onScroll = event => {
+      const target = event?.target?.nodeType === 1 ? event.target : event?.target?.scrollingElement;
+      if (!target || !this.isBehaviorInterestingTarget(target)) return;
+      const now = Date.now();
+      const previous = this.behaviorScrollLast.get(target) || 0;
+      if (now - previous < 90) return;
+      this.behaviorScrollLast.set(target, now);
+      this.recordBehavior("scroll", this.snapshotBehaviorScrollTarget(target));
+    };
+    document.addEventListener("scroll", onScroll, true);
+    cleanup.push(() => document.removeEventListener("scroll", onScroll, true));
+
+    const onWheel = event => {
+      const target = this.behaviorElementFromEvent(event);
+      if (!target || !this.isBehaviorInterestingTarget(target)) return;
+      const now = Date.now();
+      if (now - this.behaviorWheelLast < 120) return;
+      this.behaviorWheelLast = now;
+      this.recordBehavior("wheel", {
+        deltaX: Math.round(Number(event.deltaX) || 0),
+        deltaY: Math.round(Number(event.deltaY) || 0),
+        target: this.describeBehaviorElement(target),
+      });
+    };
+    document.addEventListener("wheel", onWheel, { capture: true, passive: true });
+    cleanup.push(() => document.removeEventListener("wheel", onWheel, true));
+
+    const onClick = event => {
+      const target = this.behaviorElementFromEvent(event);
+      if (!target || !this.isBehaviorInterestingTarget(target)) return;
+      if (target.closest?.(".embedded-outline-row")) return;
+      const control = target.closest?.("button, a, input, textarea, select, [role=button]");
+      if (!control && !target.matches?.("h1,h2,h3,h4,h5,h6")) return;
+      this.recordBehavior("content-click", {
+        target: this.describeBehaviorElement(control || target),
+        button: event.button,
+      });
+    };
+    document.addEventListener("click", onClick, true);
+    cleanup.push(() => document.removeEventListener("click", onClick, true));
+
+    const onKeydown = event => {
+      const navigationKeys = new Set(["Enter", "Escape", "PageDown", "PageUp", "Home", "End", "ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight"]);
+      if (!event.metaKey && !event.ctrlKey && !event.altKey && !navigationKeys.has(event.key)) return;
+      const target = this.behaviorElementFromEvent(event);
+      if (!target || !this.isBehaviorInterestingTarget(target)) return;
+      this.recordBehavior("keydown", {
+        key: event.key,
+        metaKey: !!event.metaKey,
+        ctrlKey: !!event.ctrlKey,
+        altKey: !!event.altKey,
+        shiftKey: !!event.shiftKey,
+        target: this.describeBehaviorElement(target),
+      });
+    };
+    document.addEventListener("keydown", onKeydown, true);
+    cleanup.push(() => document.removeEventListener("keydown", onKeydown, true));
+
+    const workspace = this.app.workspace?.containerEl;
+    if (workspace && typeof MutationObserver !== "undefined") {
+      let lastMutationAt = 0;
+      const observer = new MutationObserver(records => {
+        const now = Date.now();
+        if (now - lastMutationAt < 180) return;
+        const relevant = records.filter(record => {
+          const target = record.target?.nodeType === 1 ? record.target : record.target?.parentElement;
+          return this.isBehaviorInterestingTarget(target);
+        });
+        if (!relevant.length) return;
+        lastMutationAt = now;
+        const targets = [];
+        const seen = new Set();
+        for (const record of relevant.slice(0, 16)) {
+          const node = record.target?.nodeType === 1 ? record.target : record.target?.parentElement;
+          const anchor = node?.closest?.(".sync-embed, .internal-embed[src], .embedded-outline-view, .markdown-preview-view, .markdown-source-view") || node;
+          if (!anchor || seen.has(anchor)) continue;
+          seen.add(anchor);
+          targets.push(this.describeBehaviorElement(anchor));
+        }
+        this.recordBehavior("dom-mutation", {
+          recordCount: relevant.length,
+          mutationTypes: Array.from(new Set(relevant.map(record => record.type))),
+          targets,
+        });
+      });
+      observer.observe(workspace, { subtree: true, childList: true, attributes: true, attributeFilter: ["class"] });
+      cleanup.push(() => observer.disconnect());
+    }
+
+    this.behaviorDomCleanup = cleanup;
+  }
+
+  removeBehaviorDomListeners() {
+    for (const dispose of this.behaviorDomCleanup.splice(0)) {
+      try { dispose(); } catch (_) {}
+    }
+  }
+
+  updateBehaviorRecordingIndicators() {
+    const recording = this.isBehaviorRecording();
+    for (const view of this.getViews()) {
+      const button = view.contentEl?.querySelector?.(".embedded-outline-record");
+      const status = view.contentEl?.querySelector?.(".embedded-outline-recording-status");
+      if (button) {
+        button.setAttribute("aria-label", recording ? "Stop behavior recording and copy JSON" : "Start behavior recording");
+        button.setAttribute("title", recording ? "Stop behavior recording and copy JSON" : "Start behavior recording");
+        setIcon(button, recording ? "square" : "circle");
+        button.toggleClass?.("is-recording", recording);
+      }
+      if (status) {
+        status.textContent = recording ? "REC" : "";
+        status.toggleClass?.("is-recording", recording);
+      }
+    }
+  }
+
+  startBehaviorRecording() {
+    if (this.behaviorRecorder) {
+      new Notice("Embedded Outline: behavior recording is already running.");
+      return;
+    }
+    const startedAt = new Date();
+    this.behaviorRecorder = {
+      schemaVersion: BEHAVIOR_RECORDING_SCHEMA,
+      pluginVersion: "0.5.1",
+      appVersion: this.app?.appVersion || null,
+      vaultName: this.app.vault?.getName?.() || null,
+      startedAt: startedAt.toISOString(),
+      startedAtMs: startedAt.getTime(),
+      settings: { ...this.settings },
+      initialContext: this.captureBehaviorContext(),
+      events: [],
+      droppedEvents: 0,
+    };
+    this.installBehaviorDomListeners();
+    this.recordBehavior("recording-started", { context: this.captureBehaviorContext() });
+    this.updateBehaviorRecordingIndicators();
+    new Notice("Embedded Outline: behavior recording started. Reproduce the issue, then stop and copy the JSON log.");
+  }
+
+  async stopBehaviorRecording({ copy = false, save = false, silent = false } = {}) {
+    const recorder = this.behaviorRecorder;
+    if (!recorder) {
+      if (!silent) new Notice("Embedded Outline: no behavior recording is running.");
+      return this.lastBehaviorRecording;
+    }
+
+    this.recordBehavior("recording-stopped", { context: this.captureBehaviorContext() });
+    const finishedAt = new Date();
+    const report = {
+      schemaVersion: recorder.schemaVersion,
+      pluginVersion: recorder.pluginVersion,
+      appVersion: recorder.appVersion,
+      vaultName: recorder.vaultName,
+      startedAt: recorder.startedAt,
+      finishedAt: finishedAt.toISOString(),
+      durationMs: Math.max(0, finishedAt.getTime() - recorder.startedAtMs),
+      settings: recorder.settings,
+      initialContext: recorder.initialContext,
+      finalContext: this.captureBehaviorContext(),
+      droppedEvents: recorder.droppedEvents,
+      events: recorder.events,
+    };
+    this.behaviorRecorder = null;
+    this.lastBehaviorRecording = report;
+    this.removeBehaviorDomListeners();
+    this.updateBehaviorRecordingIndicators();
+
+    let savedPath = null;
+    if (save) {
+      try {
+        savedPath = await this.saveBehaviorRecording(report);
+        if (!silent) new Notice(`Embedded Outline: behavior log saved to ${savedPath}.`);
+      } catch (e) {
+        console.error("Embedded Outline: failed to save behavior recording", e);
+        if (!silent) new Notice("Embedded Outline: failed to save behavior log; it is still available for copying.");
+      }
+    }
+    if (copy) await this.copyBehaviorRecording(report, { silent });
+    if (!silent && !copy && !save) new Notice("Embedded Outline: behavior recording stopped.");
+    return { ...report, savedPath };
+  }
+
+  async copyBehaviorRecording(report = null, { silent = false } = {}) {
+    const target = report || this.lastBehaviorRecording;
+    if (!target) {
+      if (!silent) new Notice("Embedded Outline: no behavior log is available.");
+      return false;
+    }
+    const text = JSON.stringify(target, null, 2);
+    try {
+      await navigator.clipboard.writeText(text);
+      if (!silent) new Notice("Embedded Outline: behavior log copied to clipboard.");
+      return true;
+    } catch (e) {
+      console.log("Embedded Outline behavior recording:\n" + text);
+      if (!silent) new Notice("Embedded Outline: clipboard failed; behavior log was written to the developer console.");
+      return false;
+    }
+  }
+
+  async saveBehaviorRecording(report) {
+    const base = `embedded-outline-behavior-${moment().format("YYYYMMDD-HHmmss")}`;
+    let path = `${base}.json`;
+    let suffix = 1;
+    while (this.app.vault.getAbstractFileByPath(path)) path = `${base}-${suffix++}.json`;
+    await this.app.vault.create(path, JSON.stringify(report, null, 2));
+    return path;
+  }
+
+  clearBehaviorRecording() {
+    this.removeBehaviorDomListeners();
+    this.behaviorRecorder = null;
+    this.lastBehaviorRecording = null;
+    this.updateBehaviorRecordingIndicators();
+    new Notice("Embedded Outline: behavior recording cleared.");
   }
 
   getHostFile() {
@@ -860,6 +1290,12 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     if (!el?.scrollIntoView) return false;
     const behavior = options.behavior || this.getNativeScrollBehavior();
     const block = options.block || "center";
+    this.recordBehavior("dom-scroll-request", {
+      target: this.describeBehaviorElement(el),
+      boundary: this.describeBehaviorElement(boundaryEl),
+      behavior,
+      block,
+    });
     try {
       if (debug) {
         debug.domScrollStrategy = "native-element-scrollIntoView";
@@ -879,6 +1315,12 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
       : (behavior === "smooth" ? 300 : 25);
     if (settleMs) await this.wait(settleMs);
     if (options.highlight !== false) this.flashTarget(el);
+    this.recordBehavior("dom-scroll-applied", {
+      target: this.describeBehaviorElement(el),
+      position: this.snapshotBehaviorScrollTarget(el),
+      behavior,
+      block,
+    });
     return true;
   }
 
@@ -935,6 +1377,13 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     if (!markdownView || !Number.isInteger(line) || line < 0) return false;
     const editor = markdownView.editor;
     const lineCount = editor?.lineCount?.();
+    this.recordBehavior("markdown-view-scroll-request", {
+      prefix,
+      filePath: markdownView.file?.path || null,
+      mode: this.getMarkdownViewMode(markdownView),
+      line: line + 1,
+      lineCount: Number.isInteger(lineCount) ? lineCount : null,
+    });
     if (debug && Number.isInteger(lineCount)) debug[`${prefix}EditorLineCount`] = lineCount;
     if (Number.isInteger(lineCount) && line >= lineCount) {
       if (debug) debug[`${prefix}LineOutOfRange`] = true;
@@ -949,12 +1398,28 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
         if (debug) debug[`${prefix}ScrollStrategy`] = "markdown-view-currentMode.applyScroll";
         markdownView.currentMode.applyScroll(line);
         await this.wait(90);
+        this.recordBehavior("markdown-view-scroll-applied", {
+          prefix,
+          filePath: markdownView.file?.path || null,
+          mode: this.getMarkdownViewMode(markdownView),
+          line: line + 1,
+          strategy: "currentMode.applyScroll",
+          scrollSurfaces: this.getBehaviorScrollSurfaces(),
+        });
         return true;
       }
       if (typeof markdownView.setEphemeralState === "function") {
         if (debug) debug[`${prefix}ScrollStrategy`] = "markdown-view-setEphemeralState";
         markdownView.setEphemeralState({ line });
         await this.wait(90);
+        this.recordBehavior("markdown-view-scroll-applied", {
+          prefix,
+          filePath: markdownView.file?.path || null,
+          mode: this.getMarkdownViewMode(markdownView),
+          line: line + 1,
+          strategy: "setEphemeralState",
+          scrollSurfaces: this.getBehaviorScrollSurfaces(),
+        });
         return true;
       }
     } catch (e) {
@@ -1067,26 +1532,43 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
       result: "started",
     };
     this.lastNavigationDebug = debug;
+    this.recordBehavior("navigation-start", {
+      item: this.serializeBehaviorItem(item),
+      context: this.captureBehaviorContext(),
+    });
 
-    const view = this.findMarkdownViewForPath(item.hostFile);
-    debug.hostViewFound = !!view;
-    if (!view?.file || view.file.path !== item.hostFile) {
-      debug.result = "host-view-not-found";
-      return;
+    try {
+      const view = this.findMarkdownViewForPath(item.hostFile);
+      debug.hostViewFound = !!view;
+      if (!view?.file || view.file.path !== item.hostFile) {
+        debug.result = "host-view-not-found";
+        return;
+      }
+      debug.hostViewMode = this.getMarkdownViewMode(view);
+
+      if (item.kind === "local") {
+        await this.navigateLocalNative(view, item, debug);
+        return;
+      }
+
+      // Embedded Outline navigation is intentionally in-place only. v0.5.1
+      // resolves the complete nested embed trail first, then performs one final
+      // visible scroll to the exact container/heading. We never open the source
+      // note and we avoid the old root-container -> heading double scroll.
+      const ok = await this.navigateEmbeddedTrailInPlace(view, item, debug);
+      if (!ok && debug.result === "started") debug.result = "embedded-target-not-found";
+    } catch (e) {
+      debug.result = "navigation-exception";
+      debug.error = { name: e?.name || "Error", message: e?.message || String(e) };
+      console.error("Embedded Outline: navigation failed", e);
+    } finally {
+      this.recordBehavior("navigation-end", {
+        item: this.serializeBehaviorItem(item),
+        result: debug.result,
+        debug,
+        context: this.captureBehaviorContext(),
+      });
     }
-    debug.hostViewMode = this.getMarkdownViewMode(view);
-
-    if (item.kind === "local") {
-      await this.navigateLocalNative(view, item, debug);
-      return;
-    }
-
-    // Embedded Outline navigation is intentionally in-place only. v0.5.1
-    // resolves the complete nested embed trail first, then performs one final
-    // visible scroll to the exact container/heading. We never open the source
-    // note and we avoid the old root-container -> heading double scroll.
-    const ok = await this.navigateEmbeddedTrailInPlace(view, item, debug);
-    if (!ok && debug.result === "started") debug.result = "embedded-target-not-found";
   }
 
   async revealHostEmbedLineInEditorIfVisible(view, item, debug) {
@@ -1194,6 +1676,20 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
         strategy,
       };
     }
+    this.recordBehavior("embed-trail-resolution", {
+      stepIndex,
+      step: {
+        type: step?.type || null,
+        ordinal: Number.isInteger(step?.ordinal) ? step.ordinal : null,
+        sourceFile: step?.sourceFile || null,
+        section: step?.section || "",
+        containingFile: step?.containingFile || null,
+      },
+      candidateCount: candidates.length,
+      matchCount: matches.length,
+      strategy,
+      selected: this.describeBehaviorElement(selected),
+    });
     return selected;
   }
 
