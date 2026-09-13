@@ -9,6 +9,16 @@ An Obsidian plugin that builds a document-order outline containing native embeds
 - `styles.css` — plugin styles
 - `versions.json` — supported plugin and Obsidian versions
 
+## Installation
+
+1. Download `main.js`, `manifest.json`, and `styles.css` from the matching [GitHub release](https://github.com/humoumou1215/embedded-outline/releases).
+2. Create `<vault>/.obsidian/plugins/embedded-outline/` and place those three files directly inside it.
+3. Reload Obsidian, then enable **Embedded Outline** under **Settings → Community plugins**.
+
+## Usage
+
+Open a Markdown note and run **Embedded Outline: Open Embedded Outline** from the command palette, or use the ribbon icon. The view follows headings, native embeds, and Sync Embed blocks in document order. Select an entry to reveal its source location; use the refresh command after changing embed structure if needed.
+
 ## Verification
 
 The bundle was verified in Obsidian reading mode against a design document containing ordinary embeds, Sync Embeds, nested headings, and nested embeds. All 46 outline entries were clicked individually. Host headings, native embed blocks, Sync Embed blocks, outline scrolling, and collapse/expand behavior were verified.
@@ -21,4 +31,4 @@ For a file artifact instead, use `停止录制并保存行为日志`; the JSON i
 
 ## Privacy and license
 
-Embedded Outline makes no network requests, uses no telemetry, and reads only Markdown files through Obsidian's vault API. It is released under the [MIT License](LICENSE).
+Embedded Outline makes no network requests and uses no telemetry. It reads Markdown files through Obsidian's vault API. The diagnostic commands write logs to the system clipboard only when you explicitly invoke a copy command; the plugin does not read existing clipboard contents. It is released under the [MIT License](LICENSE).
