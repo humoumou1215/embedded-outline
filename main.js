@@ -1318,7 +1318,12 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     // v0.5.0 first centered the embed and then centered the heading, producing
     // the visible back-and-forth motion when headings were close together.
     let rendered = this.findRenderedHeadingInContainer(container, item);
-    if (rendered?.el) {
+    // A rendered CodeMirror line inside Sync Embed belongs to the nested
+    // MarkdownView, not to the host preview scroll surface. Let the Sync
+    // branch below use that view's applyScroll() path instead of calling
+    // scrollIntoView() on a line that can report success without moving the
+    // visible document.
+    if (rendered?.el && !container.matches?.(".sync-embed")) {
       debug.renderedHeadingStrategy = rendered.strategy;
       const ok = await this.nativeScrollElement(rendered.el, view.containerEl, debug, { highlight: true });
       debug.highlightTarget = rendered.strategy;

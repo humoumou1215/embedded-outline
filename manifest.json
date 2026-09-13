@@ -4,6 +4,7 @@
   "version": "0.5.1",
   "minAppVersion": "1.4.0",
   "description": "Outline replacement that includes native and Sync Embed blocks and their headings in document order.",
-  "author": "hu",
+  "author": "humoumou",
+  "authorUrl": "https://github.com/humoumou1215",
   "isDesktopOnly": false
 }
