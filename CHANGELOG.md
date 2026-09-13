@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.5
+
+- Apply rendered-candidate selection in the active embed-trail navigation path.
+- Wait for long smooth-scroll animations before deciding that a target was missed.
+- Avoid instant host-line scrolling for already-rendered Sync Embed containers.
+- Use a deterministic smooth scroll-surface fallback when Obsidian re-renders a local heading.
+
 ## 0.5.4
 
 - Prefer rendered native embed candidates over hidden zero-sized placeholders.
