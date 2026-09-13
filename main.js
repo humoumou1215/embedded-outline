@@ -1,4 +1,4 @@
-/* Embedded Outline v0.5.5 - generated from src/core.js + src/plugin-body.js */
+/* Embedded Outline v0.5.6 - generated from src/core.js + src/plugin-body.js */
 "use strict";
 
 function splitWikiTarget(inner) {
@@ -1407,17 +1407,12 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     return this.isElementVisibleInBoundary(element, boundaryEl) ? element : null;
   }
 
-  async animateScrollSurfaceToElement(el, surface, debug = null, options = {}) {
-    if (!el?.getBoundingClientRect || !surface?.getBoundingClientRect) return false;
-    const surfaceRect = surface.getBoundingClientRect();
-    const targetRect = el.getBoundingClientRect();
-    if (surfaceRect.height <= 0 || targetRect.height <= 0) return false;
-
+  async animateScrollSurfaceToTop(surface, targetTop, debug = null, options = {}) {
+    if (!surface?.getBoundingClientRect) return false;
     const maxTop = Math.max(0, Number(surface.scrollHeight || 0) - Number(surface.clientHeight || 0));
-    const targetTop = Math.max(0, Math.min(maxTop,
-      Number(surface.scrollTop || 0)
-      + targetRect.top - surfaceRect.top
-      - (Number(surface.clientHeight || surfaceRect.height) - targetRect.height) / 2));
+    targetTop = Math.max(0, Math.min(maxTop, Number(targetTop) || 0));
+    const targetEl = options.targetEl || surface;
+    const boundaryEl = options.boundaryEl || surface;
     const startTop = Number(surface.scrollTop || 0);
     const duration = Math.max(120, Number(options.durationMs) || this.getConfiguredScrollDurationMs());
     const behavior = "smooth";
@@ -1425,8 +1420,8 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
 
     this.ensureNavigationCurrent(debug);
     this.recordBehavior("dom-scroll-request", {
-      target: this.describeBehaviorElement(el),
-      boundary: this.describeBehaviorElement(surface),
+      target: this.describeBehaviorElement(targetEl),
+      boundary: this.describeBehaviorElement(boundaryEl),
       behavior,
       block,
       strategy: "manual-scroll-surface-scrollTop",
@@ -1473,15 +1468,31 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     }
 
     this.ensureNavigationCurrent(debug);
-    if (options.highlight !== false) this.flashTarget(el);
+    if (options.highlight !== false) this.flashTarget(options.targetEl || surface);
     this.recordBehavior("dom-scroll-applied", {
-      target: this.describeBehaviorElement(el),
-      position: this.snapshotBehaviorScrollTarget(el),
+      target: this.describeBehaviorElement(targetEl),
+      position: this.snapshotBehaviorScrollTarget(targetEl),
       behavior,
       block,
       strategy: "manual-scroll-surface-scrollTop",
     });
     return true;
+  }
+
+  async animateScrollSurfaceToElement(el, surface, debug = null, options = {}) {
+    if (!el?.getBoundingClientRect || !surface?.getBoundingClientRect) return false;
+    const surfaceRect = surface.getBoundingClientRect();
+    const targetRect = el.getBoundingClientRect();
+    if (surfaceRect.height <= 0 || targetRect.height <= 0) return false;
+
+    const targetTop = Number(surface.scrollTop || 0)
+      + targetRect.top - surfaceRect.top
+      - (Number(surface.clientHeight || surfaceRect.height) - targetRect.height) / 2;
+    return await this.animateScrollSurfaceToTop(surface, targetTop, debug, {
+      ...options,
+      targetEl: el,
+      boundaryEl: options.boundaryEl || surface,
+    });
   }
 
   hasUsableElementRect(el) {
@@ -1494,7 +1505,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     }
   }
 
-  async nativeApplyMarkdownViewScroll(markdownView, line, debug = null, prefix = "host") {
+  async nativeApplyMarkdownViewScroll(markdownView, line, debug = null, prefix = "host", options = {}) {
     this.ensureNavigationCurrent(debug);
     if (!markdownView || !Number.isInteger(line) || line < 0) return false;
     const editor = markdownView.editor;
@@ -1519,7 +1530,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
       if (typeof markdownView.currentMode?.applyScroll === "function") {
         if (debug) debug[`${prefix}ScrollStrategy`] = "markdown-view-currentMode.applyScroll";
         markdownView.currentMode.applyScroll(line);
-        await this.wait(90);
+        await this.wait(Number.isFinite(options.settleMs) ? Math.max(0, options.settleMs) : 90);
         this.ensureNavigationCurrent(debug);
         this.recordBehavior("markdown-view-scroll-applied", {
           prefix,
@@ -1534,7 +1545,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
       if (typeof markdownView.setEphemeralState === "function") {
         if (debug) debug[`${prefix}ScrollStrategy`] = "markdown-view-setEphemeralState";
         markdownView.setEphemeralState({ line });
-        await this.wait(90);
+        await this.wait(Number.isFinite(options.settleMs) ? Math.max(0, options.settleMs) : 90);
         this.ensureNavigationCurrent(debug);
         this.recordBehavior("markdown-view-scroll-applied", {
           prefix,
@@ -1781,6 +1792,49 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     return await this.nativeApplyMarkdownViewScroll(view, item.hostEmbedLine, debug, "hostEmbed");
   }
 
+  async smoothRevealHostEmbedLine(view, item, debug, resolveTarget, prefix = "hostEmbed") {
+    const surface = this.getPreviewRoot(view);
+    const beforeTop = surface && Number.isFinite(Number(surface.scrollTop))
+      ? Number(surface.scrollTop)
+      : null;
+    const previousBehavior = surface?.style?.scrollBehavior || "";
+    const applied = await this.nativeApplyMarkdownViewScroll(view, item.hostEmbedLine, debug, prefix, { settleMs: 0 });
+    const destinationTop = surface && Number.isFinite(Number(surface.scrollTop))
+      ? Number(surface.scrollTop)
+      : null;
+
+    // applyScroll() is only used as a synchronous render hint. Restore the
+    // user's position before the browser can paint the jump, then animate to
+    // the newly materialized target.
+    if (surface?.style && beforeTop != null && destinationTop != null) {
+      surface.style.scrollBehavior = "auto";
+      surface.scrollTop = beforeTop;
+      surface.style.scrollBehavior = previousBehavior;
+    }
+
+    if (!applied || !surface) return { applied, target: null, animated: false };
+    await this.wait(140);
+    this.ensureNavigationCurrent(debug);
+    const target = typeof resolveTarget === "function" ? await resolveTarget() : null;
+
+    if (target && this.hasUsableElementRect(target)) {
+      const animated = await this.animateScrollSurfaceToElement(target, surface, debug, {
+        highlight: false,
+      });
+      return { applied, target, animated };
+    }
+
+    if (destinationTop != null && beforeTop != null && Math.abs(destinationTop - beforeTop) > 1) {
+      const animated = await this.animateScrollSurfaceToTop(surface, destinationTop, debug, {
+        highlight: false,
+        targetEl: surface,
+        boundaryEl: surface,
+      });
+      return { applied, target: null, animated };
+    }
+    return { applied, target: null, animated: false };
+  }
+
   findCodeMirrorLine(editor, sourceLine) {
     try {
       const cm = editor?.cm;
@@ -1863,6 +1917,12 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     } else if (usableMatches.length > 1) {
       selected = usableMatches[0];
       strategy = "first-target-match-rendered";
+    } else if (matches.length === 1) {
+      selected = matches[0];
+      strategy = "unique-target-match";
+    } else if (matches.length > 1) {
+      selected = matches[0];
+      strategy = "first-target-match";
     } else if (ordinalEl && (matches.length === 0 || matches.includes(ordinalEl))) {
       // Runtime metadata for Sync Embeds may not exist until the element enters
       // the viewport. DOM ordinal is still the best non-destructive fallback.
@@ -2013,10 +2073,18 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     // element rather than reporting success for a 0x0 node.
     if (!this.hasUsableElementRect(container) && Number.isInteger(item.hostEmbedLine)) {
       debug.embedTargetRevealRequired = true;
-      const revealed = await this.revealHostEmbedLineInEditorIfVisible(view, item, debug);
-      debug.embedTargetRevealApplied = revealed;
-      if (revealed) {
-        await this.wait(140);
+      const reveal = await this.smoothRevealHostEmbedLine(
+        view,
+        item,
+        debug,
+        () => this.resolveEmbedTrail(view, item, debug),
+      );
+      debug.embedTargetRevealApplied = reveal.applied;
+      debug.embedTargetSmoothRevealApplied = reveal.animated;
+      if (reveal.target) {
+        container = reveal.target;
+        debug.embedTargetReResolvedAfterHostReveal = true;
+      } else if (reveal.applied) {
         const refreshed = await this.resolveEmbedTrail(view, item, debug);
         if (refreshed) {
           container = refreshed;
@@ -2035,6 +2103,16 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     // An embed-container outline row represents the visual embed block itself.
     // Highlight exactly that nested block, not the outer/root embed.
     if (item.kind === "embed-container") {
+      if (debug.embedTargetSmoothRevealApplied && this.hasUsableElementRect(container)) {
+        this.flashTarget(container);
+        debug.highlightTarget = container.matches?.(".sync-embed")
+          ? "exact-sync-embed-container-smooth-reveal"
+          : "exact-embed-container-smooth-reveal";
+        debug.result = container.matches?.(".sync-embed")
+          ? "sync-container-revealed-smooth"
+          : "embed-container-revealed-smooth";
+        return true;
+      }
       // A rendered Sync Embed can use the host preview's normal scroll surface
       // just like a native embed. Only use the instant host-line path when the
       // container is still not rendered; this avoids a visible jump for normal
@@ -2089,9 +2167,22 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
       const hostBoundary = this.getPreviewRoot(view) || view.containerEl;
       const hostEmbedVisible = this.isElementVisibleInBoundary(container, hostBoundary);
       debug.hostEmbedVisibleBeforeScroll = hostEmbedVisible;
-      if (!hostEmbedVisible && Number.isInteger(item.hostEmbedLine)) {
+      if (!hostEmbedVisible) {
         debug.hostEmbedRevealRequired = true;
-        const revealed = await this.nativeApplyMarkdownViewScroll(view, item.hostEmbedLine, debug, "hostEmbed");
+        let revealed = false;
+        if (this.hasUsableElementRect(container)) {
+          // The Sync Embed is already rendered, so its element can move the
+          // outer host preview smoothly. Calling applyScroll() here would
+          // instantly jump the host to the source line before nested
+          // heading navigation starts.
+          revealed = await this.nativeScrollElement(container, view.containerEl, debug, {
+            highlight: false,
+          });
+          debug.syncHostHeadingRevealStrategy = "rendered-container-native-smooth";
+        } else if (Number.isInteger(item.hostEmbedLine)) {
+          revealed = await this.nativeApplyMarkdownViewScroll(view, item.hostEmbedLine, debug, "hostEmbed");
+          debug.syncHostHeadingRevealStrategy = "host-line-applyScroll-for-unrendered-container";
+        }
         debug.hostEmbedRevealApplied = revealed;
         if (revealed) {
           // Sync Embeds may replace its loading placeholder with a fresh
@@ -2111,17 +2202,19 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
       let data = manager?.getEmbedFromElement?.(container) || null;
 
       if (!data?.editor) {
-        // Lazy Sync Embed: a nearest/instant reveal is only used when no runtime
-        // editor exists yet. It is not used for normal nearby-heading clicks.
+        // Lazy Sync Embed: the container is rendered, so use a smooth reveal
+        // while waiting for its runtime editor. The old auto+nearest reveal
+        // visibly jumped to the block's top before the editor was available.
         await this.nativeScrollElement(container, view.containerEl, debug, {
-          behavior: "auto",
+          behavior: this.getNativeScrollBehavior(),
           block: "nearest",
           highlight: false,
-          settleMs: 30,
+          settleMs: 0,
         });
-        const deadline = Date.now() + 650;
+        const deadline = Date.now() + Math.max(1400, this.getConfiguredScrollDurationMs() + 700);
         while (!data?.editor && Date.now() < deadline) {
-          await this.wait(45);
+          await this.wait(60);
+          this.ensureNavigationCurrent(debug);
           data = manager?.getEmbedFromElement?.(container) || null;
           if (!data?.editor) {
             const refreshed = await this.resolveEmbedTrail(view, item, debug);
@@ -2140,7 +2233,20 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
       if (data?.editor && data?.view && this.syncRuntimeMatchesStep(data, lastStep)) {
         const resolvedLine = this.resolveHeadingLineInEditor(data.editor, item, debug);
         if (resolvedLine != null) {
-          const applied = await this.nativeApplyMarkdownViewScroll(data.view, resolvedLine, debug, "sync");
+          const existingLine = this.findCodeMirrorLine(data.editor, resolvedLine);
+          let applied = false;
+          if (existingLine && this.hasUsableElementRect(existingLine)) {
+            // A mounted line can scroll through the visible host surface
+            // directly. This avoids an instant nested applyScroll() jump for
+            // already-rendered Sync headings.
+            applied = await this.nativeScrollElement(existingLine, view.containerEl, debug, {
+              highlight: false,
+            });
+            debug.syncScrollStrategy = "rendered-line-native-smooth";
+          } else {
+            applied = await this.nativeApplyMarkdownViewScroll(data.view, resolvedLine, debug, "sync");
+            debug.syncScrollStrategy = "sync-markdown-view-applyScroll-for-unmounted-line";
+          }
           if (applied) {
             await this.wait(45);
             const lineEl = this.findCodeMirrorLine(data.editor, resolvedLine)
@@ -2176,36 +2282,51 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
         }
       }
     } else {
-      // Native embeds can lazy-render their Markdown. Reveal only when the exact
-      // heading is genuinely absent, then do one final smooth scroll to it.
-      await this.nativeScrollElement(container, view.containerEl, debug, {
-        behavior: "auto",
-        block: "nearest",
-        highlight: false,
-        settleMs: 30,
-      });
-      const deadline = Date.now() + 700;
-      while (!rendered && Date.now() < deadline) {
-        await this.wait(45);
-        rendered = this.findRenderedHeadingInContainer(container, item);
+    // Native embeds can lazy-render their Markdown. When the container is
+    // already present, use a smooth reveal to trigger rendering; an instant
+    // nearest reveal made the first click visibly jump to the top of a large
+    // embed. Keep polling long enough for Obsidian to mount the inner note.
+    await this.nativeScrollElement(container, view.containerEl, debug, {
+      behavior: this.getNativeScrollBehavior(),
+      block: "nearest",
+      highlight: false,
+      settleMs: 0,
+    });
+    const deadline = Date.now() + Math.max(1800, this.getConfiguredScrollDurationMs() + 900);
+    while (!rendered && Date.now() < deadline) {
+      await this.wait(60);
+      this.ensureNavigationCurrent(debug);
+      const refreshed = await this.resolveEmbedTrail(view, item, debug);
+      if (refreshed && refreshed !== container) {
+        container = refreshed;
+        debug.resolvedTargetContainerClass = container.className || "";
       }
-      if (rendered?.el) {
-        debug.renderedHeadingStrategy = rendered.strategy + "-after-lazy-render";
-        const ok = await this.nativeScrollElement(rendered.el, view.containerEl, debug, { highlight: true });
+      rendered = this.findRenderedHeadingInContainer(container, item);
+    }
+    if (rendered?.el) {
+      debug.renderedHeadingStrategy = rendered.strategy + "-after-lazy-render";
+      const hostBoundary = this.getPreviewRoot(view) || view.containerEl;
+      if (this.isElementVisibleInBoundary(rendered.el, hostBoundary)) {
+        this.flashTarget(rendered.el);
         debug.highlightTarget = rendered.strategy;
-        debug.result = ok ? "native-heading-scrolled-after-lazy-render" : "native-heading-scroll-failed";
+        debug.result = "native-heading-revealed-after-lazy-render";
+        return true;
+      }
+      const ok = await this.nativeScrollElement(rendered.el, view.containerEl, debug, { highlight: true });
+      debug.highlightTarget = rendered.strategy;
+      debug.result = ok ? "native-heading-scrolled-after-lazy-render" : "native-heading-scroll-failed";
+      return ok;
+    }
+
+    if (this.isFirstSourceHeading(item)) {
+      const titleEl = this.findDirectEmbedTitle(container);
+      if (titleEl) {
+        const ok = await this.nativeScrollElement(titleEl, view.containerEl, debug, { highlight: true });
+        debug.highlightTarget = "native-embed-title";
+        debug.result = ok ? "native-first-heading-via-exact-embed-title" : "native-embed-title-scroll-failed";
         return ok;
       }
-
-      if (this.isFirstSourceHeading(item)) {
-        const titleEl = this.findDirectEmbedTitle(container);
-        if (titleEl) {
-          const ok = await this.nativeScrollElement(titleEl, view.containerEl, debug, { highlight: true });
-          debug.highlightTarget = "native-embed-title";
-          debug.result = ok ? "native-first-heading-via-exact-embed-title" : "native-embed-title-scroll-failed";
-          return ok;
-        }
-      }
+    }
     }
 
     // Last resort stays in-place, but for a heading row we must NOT pulse the

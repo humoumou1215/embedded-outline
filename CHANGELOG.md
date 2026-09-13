@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.6
+
+- Fix the active embed-trail resolver choosing hidden native/embed placeholders.
+- Keep rendered native and Sync Embed navigation smooth during lazy loading.
+- Avoid nested Sync Embed `applyScroll()` jumps when the target line is mounted.
+
 ## 0.5.5
 
 - Apply rendered-candidate selection in the active embed-trail navigation path.
