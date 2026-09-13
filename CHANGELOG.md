@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.7
+
+- Use the active source-mode `.cm-scroller` as the host scroll surface.
+- Restore the original source position immediately after lazy rendering and animate to the revealed embed instead of flashing through `applyScroll()`.
+- Suppress host-line re-reveal during the post-render trail refresh so the fix cannot reintroduce a second instant jump.
+
 ## 0.5.6
 
 - Fix the active embed-trail resolver choosing hidden native/embed placeholders.

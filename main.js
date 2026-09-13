@@ -1,4 +1,4 @@
-/* Embedded Outline v0.5.6 - generated from src/core.js + src/plugin-body.js */
+/* Embedded Outline v0.5.7 - generated from src/core.js + src/plugin-body.js */
 "use strict";
 
 function splitWikiTarget(inner) {
@@ -1253,6 +1253,38 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
       || null;
   }
 
+  getHostScrollSurface(view) {
+    if (this.getMarkdownViewMode(view) === "source") {
+      return view?.sourceMode?.containerEl?.querySelector?.(".cm-scroller")
+        || view?.containerEl?.querySelector?.(".cm-scroller")
+        || view?.sourceMode?.containerEl?.querySelector?.(".markdown-source-view")
+        || view?.containerEl?.querySelector?.(".markdown-source-view")
+        || view?.containerEl
+        || null;
+    }
+    return this.getPreviewRoot(view);
+  }
+
+  getSourceLineScrollTop(markdownView, line, surface) {
+    if (!markdownView || !Number.isInteger(line) || line < 0 || !surface) return null;
+    try {
+      const cm = markdownView.editor?.cm;
+      const doc = cm?.state?.doc;
+      if (!cm || !doc || typeof cm.lineBlockAt !== "function") return null;
+      const lineCount = Number(doc.lines);
+      if (!Number.isInteger(lineCount) || line >= lineCount) return null;
+      const block = cm.lineBlockAt(doc.line(line + 1).from);
+      if (!block || !Number.isFinite(Number(block.top))) return null;
+      const viewportHeight = Number(surface.clientHeight || surface.getBoundingClientRect?.().height || 0);
+      const blockHeight = Number(block.height || 0);
+      const maxTop = Math.max(0, Number(surface.scrollHeight || 0) - viewportHeight);
+      const centeredTop = Number(block.top) - Math.max(0, (viewportHeight - blockHeight) / 2);
+      return Math.max(0, Math.min(maxTop, centeredTop));
+    } catch (_) {
+      return null;
+    }
+  }
+
   getHeadingCacheForPath(path) {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) return [];
@@ -1609,7 +1641,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     debug.localTargetElementFoundBeforeScroll = !!target;
 
     if (mode === "preview") {
-      const hostBoundary = this.getPreviewRoot(view) || view.containerEl;
+      const hostBoundary = this.getHostScrollSurface(view) || view.containerEl;
       const targetVisibleBeforeScroll = this.isElementVisibleInBoundary(target, hostBoundary);
       debug.localTargetVisibleBeforeScroll = targetVisibleBeforeScroll;
 
@@ -1793,10 +1825,34 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
   }
 
   async smoothRevealHostEmbedLine(view, item, debug, resolveTarget, prefix = "hostEmbed") {
-    const surface = this.getPreviewRoot(view);
+    const surface = this.getHostScrollSurface(view);
     const beforeTop = surface && Number.isFinite(Number(surface.scrollTop))
       ? Number(surface.scrollTop)
       : null;
+
+    // In Live Preview/source mode, applyScroll() changes the CodeMirror
+    // scroller asynchronously. That delayed write is exactly what produced
+    // the visible flash in the behavior recording, even when code immediately
+    // restored scrollTop afterwards. CodeMirror already exposes the measured
+    // line block position, so use it as the smooth destination and let the
+    // normal viewport rendering mount the embed.
+    if (this.getMarkdownViewMode(view) === "source" && surface) {
+      const destinationTop = this.getSourceLineScrollTop(view, item.hostEmbedLine, surface);
+      if (destinationTop != null) {
+        if (debug) debug[`${prefix}ScrollStrategy`] = "source-line-block-manual-smooth";
+        const animated = await this.animateScrollSurfaceToTop(surface, destinationTop, debug, {
+          highlight: false,
+          targetEl: surface,
+          boundaryEl: surface,
+        });
+        await this.wait(180);
+        this.ensureNavigationCurrent(debug);
+        const target = typeof resolveTarget === "function" ? await resolveTarget() : null;
+        return { applied: animated, target, animated };
+      }
+      if (debug) debug[`${prefix}ScrollStrategy`] = "source-line-block-unavailable";
+    }
+
     const previousBehavior = surface?.style?.scrollBehavior || "";
     const applied = await this.nativeApplyMarkdownViewScroll(view, item.hostEmbedLine, debug, prefix, { settleMs: 0 });
     const destinationTop = surface && Number.isFinite(Number(surface.scrollTop))
@@ -1980,7 +2036,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     }];
   }
 
-  async resolveEmbedTrail(view, item, debug) {
+  async resolveEmbedTrail(view, item, debug, options = {}) {
     const trail = this.getItemEmbedTrail(item);
     debug.embedTrailLength = trail.length;
     if (!trail.length) return null;
@@ -1994,15 +2050,19 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
         // Only reveal when lazy rendering actually prevents us from resolving
         // the next step. Existing rendered targets never get this preliminary
         // scroll, which keeps nearby-heading navigation single-pass and crisp.
-        if (i === 0 && Number.isInteger(item.hostEmbedLine)) {
-          await this.nativeApplyMarkdownViewScroll(view, item.hostEmbedLine, debug, "trailReveal");
-        } else if (this.isEmbedContainerElement(root)) {
-          await this.nativeScrollElement(root, view.containerEl, debug, {
-            behavior: "auto",
-            block: "nearest",
-            highlight: false,
-            settleMs: 35,
-          });
+        if (options.allowHostReveal !== false) {
+          if (i === 0 && Number.isInteger(item.hostEmbedLine)) {
+            await this.nativeApplyMarkdownViewScroll(view, item.hostEmbedLine, debug, "trailReveal");
+          } else if (this.isEmbedContainerElement(root)) {
+            await this.nativeScrollElement(root, view.containerEl, debug, {
+              behavior: "auto",
+              block: "nearest",
+              highlight: false,
+              settleMs: 35,
+            });
+          }
+        } else if (debug) {
+          debug.embedTrailHostRevealSuppressed = true;
         }
 
         const deadline = Date.now() + 650;
@@ -2077,7 +2137,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
         view,
         item,
         debug,
-        () => this.resolveEmbedTrail(view, item, debug),
+        () => this.resolveEmbedTrail(view, item, debug, { allowHostReveal: false }),
       );
       debug.embedTargetRevealApplied = reveal.applied;
       debug.embedTargetSmoothRevealApplied = reveal.animated;
@@ -2085,7 +2145,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
         container = reveal.target;
         debug.embedTargetReResolvedAfterHostReveal = true;
       } else if (reveal.applied) {
-        const refreshed = await this.resolveEmbedTrail(view, item, debug);
+        const refreshed = await this.resolveEmbedTrail(view, item, debug, { allowHostReveal: false });
         if (refreshed) {
           container = refreshed;
           debug.embedTargetReResolvedAfterHostReveal = true;
@@ -2164,7 +2224,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
       // MarkdownView then updates an off-screen surface and appears to do
       // nothing. Reveal the host block first, but only when it is actually
       // outside the host viewport; this keeps nearby clicks single-pass.
-      const hostBoundary = this.getPreviewRoot(view) || view.containerEl;
+      const hostBoundary = this.getHostScrollSurface(view) || view.containerEl;
       const hostEmbedVisible = this.isElementVisibleInBoundary(container, hostBoundary);
       debug.hostEmbedVisibleBeforeScroll = hostEmbedVisible;
       if (!hostEmbedVisible) {
@@ -2305,7 +2365,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     }
     if (rendered?.el) {
       debug.renderedHeadingStrategy = rendered.strategy + "-after-lazy-render";
-      const hostBoundary = this.getPreviewRoot(view) || view.containerEl;
+      const hostBoundary = this.getHostScrollSurface(view) || view.containerEl;
       if (this.isElementVisibleInBoundary(rendered.el, hostBoundary)) {
         this.flashTarget(rendered.el);
         debug.highlightTarget = rendered.strategy;
