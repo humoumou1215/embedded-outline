@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.4
+
+- Prefer rendered native embed candidates over hidden zero-sized placeholders.
+- Smooth-scroll mounted local headings instead of jumping through MarkdownView line navigation.
+- Cancel stale navigation tasks when a newer outline row is clicked.
+
 ## 0.5.3
 
 - Fix Sync Embed heading navigation when the nested MarkdownView is not independently scrollable.

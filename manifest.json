@@ -1,7 +1,7 @@
 {
   "id": "embedded-outline",
   "name": "Embedded Outline",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "minAppVersion": "1.4.0",
   "description": "Outline replacement that includes native and Sync Embed blocks and their headings in document order.",
   "author": "humoumou",

@@ -1,4 +1,4 @@
-/* Embedded Outline v0.5.3 - generated from src/core.js + src/plugin-body.js */
+/* Embedded Outline v0.5.4 - generated from src/core.js + src/plugin-body.js */
 "use strict";
 
 function splitWikiTarget(inner) {
@@ -624,6 +624,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     await this.loadSettings();
     this.refreshTimer = null;
     this.lastNavigationDebug = null;
+    this.navigationSeq = 0;
     this.behaviorRecorder = null;
     this.lastBehaviorRecording = null;
     this.behaviorDomCleanup = [];
@@ -1287,6 +1288,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
   }
 
   async nativeScrollElement(el, boundaryEl = null, debug = null, options = {}) {
+    this.ensureNavigationCurrent(debug);
     if (!el?.scrollIntoView) return false;
     const behavior = options.behavior || this.getNativeScrollBehavior();
     const block = options.block || "center";
@@ -1314,6 +1316,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
       ? Math.max(0, options.settleMs)
       : (behavior === "smooth" ? 300 : 25);
     if (settleMs) await this.wait(settleMs);
+    this.ensureNavigationCurrent(debug);
     if (options.highlight !== false) this.flashTarget(el);
     this.recordBehavior("dom-scroll-applied", {
       target: this.describeBehaviorElement(el),
@@ -1325,6 +1328,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
   }
 
   async nativeScrollEditorLine(editor, line, rootEl, debug = null, options = {}) {
+    this.ensureNavigationCurrent(debug);
     if (!editor || !Number.isInteger(line) || line < 0) return false;
     try {
       const lineCount = Math.max(0, editor.lineCount());
@@ -1346,12 +1350,14 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
       }
       editor.scrollIntoView({ from: point, to: point }, true);
       await this.wait(55);
+      this.ensureNavigationCurrent(debug);
       const lineEl = this.findCodeMirrorLine(editor, line);
       const mounted = !!lineEl && (!rootEl || rootEl.contains(lineEl));
       if (debug) debug.editorLineElementFound = mounted;
       if (mounted && options.highlight !== false) this.flashTarget(lineEl);
       return true;
     } catch (e) {
+      if (e?.name === "EmbeddedOutlineNavigationSuperseded") throw e;
       if (debug) {
         debug.editorScrollError = { name: e?.name || "Error", message: e?.message || String(e) };
       }
@@ -1373,7 +1379,18 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     }
   }
 
+  hasUsableElementRect(el) {
+    if (!el?.getBoundingClientRect) return false;
+    try {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
   async nativeApplyMarkdownViewScroll(markdownView, line, debug = null, prefix = "host") {
+    this.ensureNavigationCurrent(debug);
     if (!markdownView || !Number.isInteger(line) || line < 0) return false;
     const editor = markdownView.editor;
     const lineCount = editor?.lineCount?.();
@@ -1398,6 +1415,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
         if (debug) debug[`${prefix}ScrollStrategy`] = "markdown-view-currentMode.applyScroll";
         markdownView.currentMode.applyScroll(line);
         await this.wait(90);
+        this.ensureNavigationCurrent(debug);
         this.recordBehavior("markdown-view-scroll-applied", {
           prefix,
           filePath: markdownView.file?.path || null,
@@ -1412,6 +1430,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
         if (debug) debug[`${prefix}ScrollStrategy`] = "markdown-view-setEphemeralState";
         markdownView.setEphemeralState({ line });
         await this.wait(90);
+        this.ensureNavigationCurrent(debug);
         this.recordBehavior("markdown-view-scroll-applied", {
           prefix,
           filePath: markdownView.file?.path || null,
@@ -1423,6 +1442,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
         return true;
       }
     } catch (e) {
+      if (e?.name === "EmbeddedOutlineNavigationSuperseded") throw e;
       if (debug) debug[`${prefix}ScrollError`] = { name: e?.name || "Error", message: e?.message || String(e) };
     }
 
@@ -1460,6 +1480,35 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     debug.localTargetElementFoundBeforeScroll = !!target;
 
     if (mode === "preview") {
+      const hostBoundary = this.getPreviewRoot(view) || view.containerEl;
+      const targetVisibleBeforeScroll = this.isElementVisibleInBoundary(target, hostBoundary);
+      debug.localTargetVisibleBeforeScroll = targetVisibleBeforeScroll;
+
+      // A mounted heading belongs directly to the host preview. Use native
+      // smooth scrolling first so local headings do not jump via Obsidian's
+      // immediate applyScroll() path. The MarkdownView path remains the
+      // fallback for virtualized headings that are not mounted yet.
+      if (target && !targetVisibleBeforeScroll && this.hasUsableElementRect(target)) {
+        const nativeOk = await this.nativeScrollElement(target, view.containerEl, debug, { highlight: false });
+        const mountedTarget = this.findLocalPreviewHeading(view, item) || target;
+        const targetVisibleAfterNativeScroll = this.isElementVisibleInBoundary(mountedTarget, hostBoundary);
+        debug.localTargetVisibleAfterNativeScroll = targetVisibleAfterNativeScroll;
+        if (nativeOk && targetVisibleAfterNativeScroll) {
+          this.flashTarget(mountedTarget);
+          debug.localTargetElementFoundAfterScroll = true;
+          debug.highlightTarget = "local-heading-element-smooth";
+          debug.result = "local-heading-scrolled-smooth-via-rendered-dom";
+          return true;
+        }
+        debug.localNativeScrollDidNotReveal = true;
+      } else if (target && targetVisibleBeforeScroll) {
+        this.flashTarget(target);
+        debug.localTargetElementFoundAfterScroll = true;
+        debug.highlightTarget = "local-heading-already-visible";
+        debug.result = "local-heading-already-visible";
+        return true;
+      }
+
       const ok = await this.nativeApplyMarkdownViewScroll(view, item.sourceLine, debug, "host");
       if (!ok) {
         debug.result = "local-native-scroll-failed";
@@ -1508,7 +1557,9 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
   }
 
   async navigateToItem(item) {
+    const navigationId = ++this.navigationSeq;
     const debug = {
+      navigationId,
       pluginVersion: this.manifest?.version || null,
       timestamp: new Date().toISOString(),
       item: {
@@ -1551,16 +1602,20 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
         return;
       }
 
-      // Embedded Outline navigation is intentionally in-place only. v0.5.3
+      // Embedded Outline navigation is intentionally in-place only. v0.5.4
       // resolves the complete nested embed trail first, then performs one final
       // visible scroll to the exact container/heading. We never open the source
       // note and we avoid the old root-container -> heading double scroll.
       const ok = await this.navigateEmbeddedTrailInPlace(view, item, debug);
       if (!ok && debug.result === "started") debug.result = "embedded-target-not-found";
     } catch (e) {
-      debug.result = "navigation-exception";
-      debug.error = { name: e?.name || "Error", message: e?.message || String(e) };
-      console.error("Embedded Outline: navigation failed", e);
+      if (e?.name === "EmbeddedOutlineNavigationSuperseded") {
+        debug.result = "navigation-superseded";
+      } else {
+        debug.result = "navigation-exception";
+        debug.error = { name: e?.name || "Error", message: e?.message || String(e) };
+        console.error("Embedded Outline: navigation failed", e);
+      }
     } finally {
       this.recordBehavior("navigation-end", {
         item: this.serializeBehaviorItem(item),
@@ -2221,51 +2276,77 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
   chooseNativeEmbedCandidate(candidates, matches, item) {
     const ordinal = item.rootEmbedOrdinal ?? item.embedOrdinal;
     const ordinalEl = Number.isInteger(ordinal) ? candidates[ordinal] : null;
-    if (ordinalEl && matches.includes(ordinalEl)) return ordinalEl;
+    const usableMatches = matches.filter(el => this.hasUsableElementRect(el));
+    if (ordinalEl && matches.includes(ordinalEl)
+      && (this.hasUsableElementRect(ordinalEl) || !usableMatches.length)) return ordinalEl;
+    if (usableMatches.length) return usableMatches[0];
     if (matches.length) return matches[0];
     return ordinalEl || null;
   }
 
   async navigateNativeEmbedInPlace(view, item, debug) {
-    let candidates = this.getTopLevelNativeEmbedElements(view.containerEl);
-    if (!candidates.length) {
-      await this.revealHostEmbedLineInEditorIfVisible(view, item, debug);
-      await this.wait(80);
-      candidates = this.getTopLevelNativeEmbedElements(view.containerEl);
-    }
-
     const rootFile = this.getRootTargetFile(item);
     const rootSection = this.normalizeSection(item.rootEmbedSection || item.section);
-    let matches = candidates.filter(el => {
-      const spec = this.resolveNativeEmbedSpec(el, item.hostFile);
-      return spec?.file?.path === rootFile && this.normalizeSection(spec.section) === rootSection;
-    });
-    debug.nativeCandidateCount = candidates.length;
-    debug.nativeMatchCount = matches.length;
+    let candidates = [];
+    let matches = [];
 
-    const candidate = this.chooseNativeEmbedCandidate(candidates, matches, item);
+    const resolveCandidate = () => {
+      candidates = this.getTopLevelNativeEmbedElements(view.containerEl);
+      matches = candidates.filter(el => {
+        const spec = this.resolveNativeEmbedSpec(el, item.hostFile);
+        return spec?.file?.path === rootFile && this.normalizeSection(spec.section) === rootSection;
+      });
+      debug.nativeCandidateCount = candidates.length;
+      debug.nativeMatchCount = matches.length;
+      return this.chooseNativeEmbedCandidate(candidates, matches, item);
+    };
+
+    let candidate = resolveCandidate();
+    if (!candidate) {
+      await this.revealHostEmbedLineInEditorIfVisible(view, item, debug);
+      await this.wait(80);
+      candidate = resolveCandidate();
+    }
+
     if (!candidate) {
       debug.result = "native-embed-dom-not-found";
       return false;
     }
 
-    // Browser/Obsidian-native element scrolling only; no manual scrollTop math.
-    await this.nativeScrollElement(candidate, view.containerEl, debug, { highlight: false });
+    // Obsidian can expose a hidden zero-sized duplicate alongside the loaded
+    // native embed. Prefer a rendered candidate; if none is rendered yet,
+    // reveal the host line and resolve the DOM again before scrolling.
+    debug.nativeCandidateUsableBeforeReveal = this.hasUsableElementRect(candidate);
+    if (!debug.nativeCandidateUsableBeforeReveal && Number.isInteger(item.hostEmbedLine)) {
+      debug.nativeHostRevealRequired = true;
+      const revealed = await this.revealHostEmbedLineInEditorIfVisible(view, item, debug);
+      debug.nativeHostRevealApplied = revealed;
+      if (revealed) {
+        await this.wait(120);
+        const refreshed = resolveCandidate();
+        if (refreshed) {
+          candidate = refreshed;
+          debug.nativeCandidateReResolvedAfterHostReveal = true;
+        }
+      }
+    }
 
+    debug.nativeCandidateUsable = this.hasUsableElementRect(candidate);
+    if (!debug.nativeCandidateUsable) {
+      debug.result = "native-embed-not-rendered";
+      return false;
+    }
+
+    // A container row represents the container itself. Scroll it exactly once.
     if ((item.depth || 0) > 1 || item.kind === "embed-container") {
       const ok = await this.nativeScrollElement(candidate, view.containerEl, debug, { highlight: true });
       debug.result = ok ? ((item.depth || 0) > 1 ? "native-nested-root-scrolled-native" : "native-container-scrolled-native") : "native-container-scroll-failed";
       return ok;
     }
 
-    let heading = null;
-    const deadline = Date.now() + 1200;
-    while (!heading && Date.now() < deadline) {
-      heading = this.findNativeEmbedHeading(candidate, item);
-      if (heading) break;
-      await this.wait(60);
-    }
-
+    // If the exact heading is already rendered, scroll it directly. This
+    // avoids the old container-then-heading double scroll.
+    let heading = this.findNativeEmbedHeading(candidate, item);
     if (heading) {
       const ok = await this.nativeScrollElement(heading, view.containerEl, debug, { highlight: true });
       debug.result = ok ? "native-heading-scrolled-native" : "native-heading-scroll-failed";
@@ -2275,8 +2356,9 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     // Obsidian may visually replace/suppress the first H1 of an embedded note
     // with the embed title. Treat that title as the native visual target rather
     // than inventing coordinates for a heading that is not in the DOM.
+    const findTitle = () => candidate.querySelector(".markdown-embed-title, .file-embed-title, .markdown-embed-link");
     if (this.isFirstSourceHeading(item)) {
-      const titleEl = candidate.querySelector(".markdown-embed-title, .file-embed-title, .markdown-embed-link");
+      const titleEl = findTitle();
       if (titleEl) {
         const ok = await this.nativeScrollElement(titleEl, view.containerEl, debug, { highlight: true });
         debug.nativeUsedEmbedTitleFallback = true;
@@ -2285,9 +2367,55 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
       }
     }
 
-    const ok = await this.nativeScrollElement(candidate, view.containerEl, debug, { highlight: true });
-    debug.result = ok ? "native-container-scrolled-heading-not-rendered" : "native-container-scroll-failed-heading-not-rendered";
-    return ok;
+    // The embed may be rendered but its inner Markdown has not mounted yet.
+    // Use one smooth container reveal to trigger lazy rendering, then resolve
+    // the exact heading without issuing a second competing scroll.
+    const revealed = await this.nativeScrollElement(candidate, view.containerEl, debug, {
+      highlight: false,
+    });
+    if (revealed) {
+      await this.wait(80);
+      const refreshed = resolveCandidate();
+      if (refreshed) candidate = refreshed;
+      const deadline = Date.now() + 1200;
+      while (!heading && Date.now() < deadline) {
+        heading = this.findNativeEmbedHeading(candidate, item);
+        if (heading) break;
+        await this.wait(60);
+      }
+    }
+
+    if (heading) {
+      // The container reveal already positioned the heading's embed. Highlight
+      // the exact heading without starting a second scroll animation.
+      this.flashTarget(heading);
+      debug.highlightTarget = "native-heading-after-container-reveal";
+      debug.result = "native-heading-revealed-with-container";
+      return true;
+    }
+
+    if (this.isFirstSourceHeading(item)) {
+      const titleEl = findTitle();
+      if (titleEl) {
+        this.flashTarget(titleEl);
+        debug.nativeUsedEmbedTitleFallback = true;
+        debug.highlightTarget = "native-embed-title-after-container-reveal";
+        debug.result = "native-first-heading-revealed-with-container-title";
+        return true;
+      }
+    }
+
+    debug.highlightTarget = null;
+    debug.result = revealed ? "native-container-scrolled-heading-unresolved" : "native-container-scroll-failed-heading-unresolved";
+    return revealed;
+  }
+
+  ensureNavigationCurrent(debug) {
+    if (!debug || !Number.isInteger(debug.navigationId) || debug.navigationId === this.navigationSeq) return;
+    debug.navigationSuperseded = true;
+    const error = new Error("A newer outline navigation superseded this navigation.");
+    error.name = "EmbeddedOutlineNavigationSuperseded";
+    throw error;
   }
 
   flashTarget(el) {
