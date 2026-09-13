@@ -1,4 +1,4 @@
-/* Embedded Outline v0.5.1 - generated from src/core.js + src/plugin-body.js */
+/* Embedded Outline v0.5.3 - generated from src/core.js + src/plugin-body.js */
 "use strict";
 
 function splitWikiTarget(inner) {
@@ -988,7 +988,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
     const startedAt = new Date();
     this.behaviorRecorder = {
       schemaVersion: BEHAVIOR_RECORDING_SCHEMA,
-      pluginVersion: "0.5.1",
+      pluginVersion: this.manifest?.version || null,
       appVersion: this.app?.appVersion || null,
       vaultName: this.app.vault?.getName?.() || null,
       startedAt: startedAt.toISOString(),
@@ -1509,7 +1509,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
 
   async navigateToItem(item) {
     const debug = {
-      pluginVersion: "0.5.1",
+      pluginVersion: this.manifest?.version || null,
       timestamp: new Date().toISOString(),
       item: {
         kind: item.kind,
@@ -1551,7 +1551,7 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
         return;
       }
 
-      // Embedded Outline navigation is intentionally in-place only. v0.5.1
+      // Embedded Outline navigation is intentionally in-place only. v0.5.3
       // resolves the complete nested embed trail first, then performs one final
       // visible scroll to the exact container/heading. We never open the source
       // note and we avoid the old root-container -> heading double scroll.
@@ -1909,11 +1909,28 @@ module.exports = class EmbeddedOutlinePlugin extends Plugin {
             const lineEl = this.findCodeMirrorLine(data.editor, resolvedLine)
               || this.findRenderedHeadingInContainer(container, item)?.el;
             if (lineEl) {
-              // applyScroll already performed the native scroll. Do not call
-              // scrollIntoView a second time; just mark the exact target.
+              // Sync Embed can expose a complete, non-scrollable nested
+              // MarkdownView. In that case applyScroll() returns successfully
+              // but cannot move the host preview, leaving the requested line
+              // outside the user's viewport. Only fall back to the host scroll
+              // when the exact line is still outside the host preview; this
+              // keeps already-visible headings single-pass.
+              const headingVisibleInHost = this.isElementVisibleInBoundary(lineEl, hostBoundary);
+              debug.syncHeadingVisibleInHostAfterMarkdownScroll = headingVisibleInHost;
+              let hostHeadingRevealApplied = false;
+              if (!headingVisibleInHost) {
+                debug.syncHostHeadingRevealRequired = true;
+                hostHeadingRevealApplied = await this.nativeScrollElement(lineEl, view.containerEl, debug, {
+                  highlight: false,
+                });
+                debug.syncHostHeadingRevealApplied = hostHeadingRevealApplied;
+              }
+
               this.flashTarget(lineEl);
               debug.highlightTarget = "sync-editor-heading-line";
-              debug.result = "sync-heading-scrolled-once-via-markdown-view";
+              debug.result = hostHeadingRevealApplied
+                ? "sync-heading-scrolled-via-markdown-view-and-host-reveal"
+                : "sync-heading-scrolled-once-via-markdown-view";
               return true;
             }
             debug.result = "sync-heading-scrolled-target-not-mounted";
